@@ -43,14 +43,8 @@ import org.apache.lucene.document.Document;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexableField;
-import org.apache.lucene.search.BooleanClause;
-import org.apache.lucene.search.BooleanQuery;
-import org.apache.lucene.search.BoostQuery;
-import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.Query;
-import org.apache.lucene.search.Sort;
-import org.apache.lucene.search.SortField;
-import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.search.*;
 import org.apache.lucene.search.similarities.BM25Similarity;
 import org.apache.lucene.search.similarities.LMDirichletSimilarity;
 import org.apache.lucene.search.similarities.Similarity;
@@ -68,19 +62,17 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.SortedMap;
+import java.util.*;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.util.Scanner;
 
 /**
  * Class that exposes basic search functionality, designed specifically to provide the bridge between Java and Python
@@ -100,6 +92,12 @@ public class SimpleSearcher implements Closeable {
 
     @Option(name = "-output", metaVar = "[file]", required = true, usage = "Output run file.")
     public String output;
+
+    @Option(name = "-runfile", metaVar = "[file]", usage = "documents id to rank bm25 on.")
+    public String runfile;
+
+    @Option(name = "-rerank", usage = "whether to rerank")
+    public boolean rerank = false;
 
     @Option(name = "-bm25", usage = "Flag to use BM25.", forbids = {"-ql"})
     public Boolean useBM25 = true;
@@ -346,7 +344,6 @@ public class SimpleSearcher implements Closeable {
   public Result[] search(String q, int k) throws IOException {
     Query query = new BagOfWordsQueryGenerator().buildQuery(IndexArgs.CONTENTS, analyzer, q);
     List<String> queryTokens = AnalyzerUtils.analyze(analyzer, q);
-
     return search(query, queryTokens, q, k);
   }
 
@@ -380,10 +377,111 @@ public class SimpleSearcher implements Closeable {
     ScoredDocuments hits = cascade.run(ScoredDocuments.fromTopDocs(rs, searcher), context);
 
     Result[] results = new Result[hits.ids.length];
+
+    BooleanQuery.Builder filterBuilder = new BooleanQuery.Builder();
+    for (int i = 0; i < hits.ids.length; i++) {
+      String docid = hits.documents[i].getField(IndexArgs.ID).stringValue();
+      Query tq = new ConstantScoreQuery(new TermQuery(new Term(IndexArgs.ID, docid)));
+      filterBuilder.add(new BooleanClause(tq, BooleanClause.Occur.SHOULD));
+    }
+    BooleanQuery filterQuery = filterBuilder.build();
+    BooleanQuery.Builder finalBuilder = new BooleanQuery.Builder();
+    finalBuilder.add(filterQuery, BooleanClause.Occur.MUST);
+    finalBuilder.add(query, BooleanClause.Occur.MUST);
+    Query fq = finalBuilder.build();
+    System.out.println("filter query: " + fq.toString() + "\n\n");
+
+    for (int i = 0; i < hits.ids.length; i++) {
+      Document doc = hits.documents[i];
+      String docid = doc.getField(IndexArgs.ID).stringValue();
+      System.out.println(">>> docid : " + docid);
+
+      /*
+      Query filterquery = new ConstantScoreQuery(new TermQuery(new Term(IndexArgs.ID, docid)));
+      Query filterquery = new TermQuery(new Term(IndexArgs.ID, docid));
+      BooleanQuery.Builder builder = new BooleanQuery.Builder();
+      builder.add(filterquery, BooleanClause.Occur.MUST);
+      builder.add(query, BooleanClause.Occur.MUST);
+      Query finalQuery = builder.build();
+
+      System.out.println("doc filter query: " + filterquery.toString());
+      System.out.println("final: " + finalQuery.toString());
+      */
+
+      IndexableField field;
+      field = doc.getField(IndexArgs.CONTENTS);
+      String contents = field == null ? null : field.stringValue();
+
+      field = doc.getField(IndexArgs.RAW);
+      String raw = field == null ? null : field.stringValue();
+
+      results[i] = new Result(docid, hits.ids[i], hits.scores[i], contents, raw, doc);
+    }
+
+    return results;
+  }
+
+  protected Result[] rerank(String queryString, int k, Set<String> docids) throws IOException {
+    // Create an IndexSearch only once. Note that the object is thread safe.
+    if (searcher == null) {
+      searcher = new IndexSearcher(reader);
+      searcher.setSimilarity(similarity);
+    }
+
+    SearchArgs searchArgs = new SearchArgs();
+    searchArgs.arbitraryScoreTieBreak = false;
+    searchArgs.hits = k;
+
+    // from computeQueryDocumentScore
+    /*
+    List<TopDocs> allRs = new ArrayList<TopDocs>();
+    Query query = new BagOfWordsQueryGenerator().buildQuery(IndexArgs.CONTENTS, analyzer, queryString);
+    for (String docid : docids) {
+      Query filteredQuery = new ConstantScoreQuery(new TermQuery(new Term(IndexArgs.ID, docid)));
+
+      BooleanQuery.Builder builder = new BooleanQuery.Builder();
+      builder.add(filteredQuery, BooleanClause.Occur.MUST);
+      builder.add(query, BooleanClause.Occur.MUST);
+      Query finalQuery = builder.build();
+
+      TopDocs rs = searcher.search(finalQuery, 1);
+      if (rs.scoreDocs.length > 0) {
+        rs.scoreDocs[0].score -= 1;  // for the ConstantScoreQuery
+        allRs.add(rs);
+      }
+    }
+    TopDocs[] shardHits = allRs.toArray(new TopDocs[0]);
+    TopDocs rs = TopDocs.merge(allRs.size(), shardHits);
+    */
+    BooleanQuery.Builder filterBuilder = new BooleanQuery.Builder();
+    for (String docid: docids) {
+      Query q = new ConstantScoreQuery(new TermQuery(new Term(IndexArgs.ID, docid)));
+      filterBuilder.add(q, BooleanClause.Occur.SHOULD);
+    }
+
+    Query query = new BagOfWordsQueryGenerator().buildQuery(IndexArgs.CONTENTS, analyzer, queryString);
+    Query filterQuery = filterBuilder.build();
+
+    BooleanQuery.Builder finalBuilder = new BooleanQuery.Builder();
+    finalBuilder.add(query, BooleanClause.Occur.MUST);
+    finalBuilder.add(filterQuery, BooleanClause.Occur.MUST);
+    BooleanQuery finalQuery = finalBuilder.build();
+
+    int topK = Math.min(k, docids.size());
+    TopDocs rs = searcher.search(finalQuery, topK);
+
+    RerankerContext context;
+    List<String> queryTokens = AnalyzerUtils.analyze(analyzer, queryString);
+    context = new RerankerContext<>(searcher, null, query, null,
+            queryString, queryTokens, null, searchArgs);
+    ScoredDocuments hits = cascade.run(ScoredDocuments.fromTopDocs(rs, searcher), context);
+
+    Result[] results = new Result[hits.ids.length];
     for (int i = 0; i < hits.ids.length; i++) {
       Document doc = hits.documents[i];
       String docid = doc.getField(IndexArgs.ID).stringValue();
 
+      System.out.println("rerank docid: " + docid);
       IndexableField field;
       field = doc.getField(IndexArgs.CONTENTS);
       String contents = field == null ? null : field.stringValue();
@@ -519,6 +617,34 @@ public class SimpleSearcher implements Closeable {
     return IndexReaderUtils.documentRaw(reader, docid);
   }
 
+  public Map<String, Set<String>> get_docids(String path) {
+    Map<String, Set<String>> qid2docid = new HashMap<String, Set<String>>();
+    try {
+      File file = new File(path);
+      Scanner scanner = new Scanner(file);
+      while (scanner.hasNextLine()) {
+        String line = scanner.nextLine();
+        String[] lines = line.strip().split(" ");  // qid, Q0, docid, rank, score, source
+        String qid = lines[0];
+        String docid = lines[2];
+
+        if (qid2docid.containsKey(qid)) {
+          Set<String> docids = qid2docid.get(qid);
+          docids.add(docid);
+          qid2docid.replace(qid, docids);
+        } else {
+          Set<String> docids = new HashSet<String>();
+          docids.add(docid);
+          qid2docid.put(qid, docids);
+        }
+      }
+    } catch (FileNotFoundException e) {
+      System.out.println("file: " + path + "is not found");
+      e.printStackTrace();
+    }
+    return qid2docid;
+  }
+
   // Note that this class is primarily meant to be used by automated regression scripts, not humans!
   // tl;dr - Do not use this class for running experiments. Use SearchCollection instead!
   //
@@ -543,6 +669,9 @@ public class SimpleSearcher implements Closeable {
     SimpleSearcher searcher = new SimpleSearcher(searchArgs.index);
     SortedMap<Object, Map<String, String>> topics = TopicReader.getTopicsByFile(searchArgs.topics);
 
+    System.out.println("topics file |  " + searchArgs.topics);
+    System.out.println(String.format("length of topics: ||| %d ", topics.size())); // NullPointerException
+
     PrintWriter out = new PrintWriter(Files.newBufferedWriter(Paths.get(searchArgs.output), StandardCharsets.US_ASCII));
     List<String> argsAsList = Arrays.asList(args);
 
@@ -566,10 +695,18 @@ public class SimpleSearcher implements Closeable {
       }
     }
 
+    if (searchArgs.rerank) {
+      Map<String, Set<String>> qid2docids = searcher.get_docids(searchArgs.runfile);
+      for (Object id: topics.keySet()) {
+        Set<String> docids = qid2docids.get(id.toString());
+        Result[] results = searcher.rerank(topics.get(id).get("title"), searchArgs.hits, docids);
+      }
+      return;
+    }
+
     if (searchArgs.threads == 1) {
       for (Object id : topics.keySet()) {
         Result[] results = searcher.search(topics.get(id).get("title"), searchArgs.hits);
-
         for (int i = 0; i < results.length; i++) {
           out.println(String.format(Locale.US, "%s Q0 %s %d %f Anserini",
               id, results[i].docid, (i + 1), results[i].score));

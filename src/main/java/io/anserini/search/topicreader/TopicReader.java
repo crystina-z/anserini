@@ -41,6 +41,7 @@ public abstract class TopicReader<K> {
 
   // Holds mappings from known topic files to corresponding TopicReader class.
   static private final Map<String, Class<? extends TopicReader>> TOPIC_FILE_TO_TYPE = Map.ofEntries(
+      Map.entry("topic.trec", TrecTopicReader.class),
       Map.entry("topics.adhoc.51-100.txt", TrecTopicReader.class),
       Map.entry("topics.adhoc.101-150.txt", TrecTopicReader.class),
       Map.entry("topics.adhoc.151-200.txt", TrecTopicReader.class),
