@@ -22,6 +22,7 @@ import org.apache.lucene.search.Query;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Set;
 
 public class RerankerContext<K> {
   private final IndexSearcher searcher;
@@ -34,9 +35,10 @@ public class RerankerContext<K> {
   private final SearchArgs searchArgs;
 
   private final boolean rerank;
+  private final Set<String> rerankDocids;
 
   public RerankerContext(IndexSearcher searcher, K queryId, Query query, String queryDocId, String queryText,
-       List<String> queryTokens, Query filter, SearchArgs searchArgs, boolean rerank) throws IOException {
+       List<String> queryTokens, Query filter, SearchArgs searchArgs, boolean rerank, Set<String> rerankDocids) throws IOException {
     this.searcher = searcher;
     this.query = query;
     this.queryId = queryId;
@@ -46,15 +48,22 @@ public class RerankerContext<K> {
     this.filter = filter;
     this.searchArgs = searchArgs;
     this.rerank = rerank;
+    this.rerankDocids = rerankDocids;
   }
 
   public RerankerContext(IndexSearcher searcher, K queryId, Query query, String queryDocId, String queryText,
       List<String> queryTokens, Query filter, SearchArgs searchArgs) throws IOException {
-    this(searcher, queryId, query, queryDocId, queryText, queryTokens, filter, searchArgs, false);
+    this(
+            searcher, queryId, query, queryDocId, queryText, queryTokens, filter, searchArgs,
+            false, null);
   }
 
   public boolean getRerank() {
     return rerank;
+  }
+
+  public Set<String> getRerankDocids() {
+    return rerankDocids;
   }
 
   public IndexSearcher getIndexSearcher() {

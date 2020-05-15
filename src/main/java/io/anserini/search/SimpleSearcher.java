@@ -152,7 +152,7 @@ public class SimpleSearcher implements Closeable {
   protected RerankerCascade cascade;
   protected boolean isRerank;
 
-  protected static List<RerankerCascade> cascades;
+  protected static List<RerankerCascade> cascades =  new ArrayList<RerankerCascade>();
   protected IndexSearcher searcher = null;
 
   /**
@@ -253,7 +253,7 @@ public class SimpleSearcher implements Closeable {
 
   public void setRM3Reranker(Args args) {
     isRerank = true;
-    cascades = new ArrayList<>();
+//    cascades = new ArrayList<>();
 
     boolean rm3_outputQuery = false;
     for (String fbTerms : args.rm3_fbTerms_array) {
@@ -440,12 +440,18 @@ public class SimpleSearcher implements Closeable {
     return results;
   }
 
+  protected Result[] rerank(String queryString, int k, Set<String> docids) throws IOException {
+    return rerank(queryString, k, docids, cascade);
+  }
+
   protected Result[] rerank(String queryString, int k, Set<String> docids, RerankerCascade cur_cascade) throws IOException {
     // Create an IndexSearch only once. Note that the object is thread safe.
     if (searcher == null) {
       searcher = new IndexSearcher(reader);
       searcher.setSimilarity(similarity);
     }
+
+    System.out.print(String.format("qid number of doc: %d; expect %d", docids.size(), k));
 
     SearchArgs searchArgs = new SearchArgs();
     searchArgs.arbitraryScoreTieBreak = false;
@@ -470,10 +476,13 @@ public class SimpleSearcher implements Closeable {
     TopDocs rs = searcher.search(finalQuery, topK);
     for (int i = 0; i < rs.scoreDocs.length; i++) { rs.scoreDocs[i].score -= 1; }  // extract 1 from ConstantScoreQuery
 
+    System.out.print(String.format("\t>> after bm25: %d", rs.scoreDocs.length));
+
     RerankerContext context;
     List<String> queryTokens = AnalyzerUtils.analyze(analyzer, queryString);
+
     context = new RerankerContext<>(searcher, null, finalQuery, null,
-            queryString, queryTokens, null, searchArgs, true);  // the finalQuery here does not help the rm3 reranker
+            queryString, queryTokens, null, searchArgs, true, docids);  // the finalQuery here does not help the rm3 reranker
     ScoredDocuments hits = cur_cascade.run(ScoredDocuments.fromTopDocs(rs, searcher), context);
 
     Result[] results = new Result[hits.ids.length];
@@ -490,6 +499,7 @@ public class SimpleSearcher implements Closeable {
 
       results[i] = new Result(docid, hits.ids[i], hits.scores[i], contents, raw, doc);
     }
+    System.out.println(String.format("\t>> after rm3: %d", results.length));
 
     return results;
   }
@@ -696,16 +706,22 @@ public class SimpleSearcher implements Closeable {
         LOG.info("Multi RM3 parameters");
         searcher.setRM3Reranker(searchArgs);
       }
+
       Map<String, Set<String>> qid2docids = searcher.get_docids(searchArgs.runfile);
       int curline = 0;
       int total = topics.size();
 
       Map<String, PrintWriter> outs = new HashMap<String, PrintWriter>();
-      for (RerankerCascade cur_cascade: cascades) {
-        String name = cur_cascade.getTag();
-        String path = searchArgs.output + "_" + cur_cascade.getTag();
-        PrintWriter outtmp = new PrintWriter(Files.newBufferedWriter(Paths.get(path), StandardCharsets.US_ASCII));
-        outs.put(name, outtmp);
+      if (cascades.size() > 0) {
+        for (RerankerCascade cur_cascade: cascades) {
+          String name = cur_cascade.getTag();
+          String path = searchArgs.output + "_" + cur_cascade.getTag();
+          PrintWriter outtmp = new PrintWriter(Files.newBufferedWriter(Paths.get(path), StandardCharsets.US_ASCII));
+          outs.put(name, outtmp);
+        }
+      } else {
+        PrintWriter out = new PrintWriter(Files.newBufferedWriter(Paths.get(searchArgs.output), StandardCharsets.US_ASCII));
+        outs.put("default", out);
       }
 
       for (Object id: topics.keySet()) {
@@ -714,19 +730,22 @@ public class SimpleSearcher implements Closeable {
         if (curline % 1000 == 0) { LOG.info(String.format("Retrieving query %d / %d", curline, total)); }
 
         Set<String> docids = qid2docids.get(id.toString());
-        System.out.println(String.format("qid: %s number of doc: %d", id.toString(), docids.size()));
 
-        for (RerankerCascade cur_cascade: cascades) {
+        if (cascades.size() > 0) {
+          for (RerankerCascade cur_cascade: cascades) {
 //        PrintWriter outtmp = new PrintWriter(Files.newBufferedWriter(
 //          Paths.get(searchArgs.output+cur_cascade.getTag()), StandardCharsets.US_ASCII));
-          PrintWriter outtmp = outs.get(cur_cascade.getTag());
-          Result[] results = searcher.rerank(topics.get(id).get("title"), searchArgs.hits, docids, cur_cascade);
+            PrintWriter outtmp = outs.get(cur_cascade.getTag());
+            Result[] results = searcher.rerank(topics.get(id).get("title"), searchArgs.hits, docids, cur_cascade);
+            for (int i = 0; i < results.length; i++) { outtmp.println(String.format(Locale.US, "%s Q0 %s %d %f Anserini", id, results[i].docid, (i + 1), results[i].score)); }
+          } // for
+        } else {
+          Result[] results = searcher.rerank(topics.get(id).get("title"), searchArgs.hits, docids);
           for (int i = 0; i < results.length; i++) {
-            outtmp.println(String.format(Locale.US, "%s Q0 %s %d %f Anserini",
-                    id, results[i].docid, (i + 1), results[i].score));
-          }
-        }
-      }
+            outs.get("default").println(String.format(Locale.US, "%s Q0 %s %d %f Anserini", id, results[i].docid, (i + 1), results[i].score));
+          } // for
+        } // if
+      } // for
 
       for (String name: outs.keySet()) { outs.get(name).close(); }
       return;
@@ -737,8 +756,7 @@ public class SimpleSearcher implements Closeable {
       for (Object id : topics.keySet()) {
         Result[] results = searcher.search(topics.get(id).get("title"), searchArgs.hits);
         for (int i = 0; i < results.length; i++) {
-          out.println(String.format(Locale.US, "%s Q0 %s %d %f Anserini",
-              id, results[i].docid, (i + 1), results[i].score));
+          out.println(String.format(Locale.US, "%s Q0 %s %d %f Anserini", id, results[i].docid, (i + 1), results[i].score));
         }
       }
     } else {

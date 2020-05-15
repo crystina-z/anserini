@@ -106,8 +106,10 @@ public class Rm3Reranker implements Reranker {
 
       if (context.getRerank()) {
         BooleanQuery.Builder filterBuilder = new BooleanQuery.Builder();
-        for (Document doc: docs.documents) {
-          String docid = doc.getField(IndexArgs.ID).stringValue();
+//        for (Document doc: docs.documents) {
+//          String docid = doc.getField(IndexArgs.ID).stringValue();
+        Set<String> docids = context.getRerankDocids();
+        for (String docid : docids) {
           Query q = new ConstantScoreQuery(new TermQuery(new Term(IndexArgs.ID, docid)));
           filterBuilder.add(q, BooleanClause.Occur.SHOULD);
         }
@@ -115,7 +117,7 @@ public class Rm3Reranker implements Reranker {
 
         BooleanQuery.Builder finalBuilder = new BooleanQuery.Builder();
         finalBuilder.add(filterQuery, BooleanClause.Occur.MUST);
-        finalBuilder.add(feedbackQuery, BooleanClause.Occur.MUST);
+        finalBuilder.add(finalQuery, BooleanClause.Occur.MUST);
         finalQuery = finalBuilder.build();
       }
 
@@ -127,14 +129,16 @@ public class Rm3Reranker implements Reranker {
       } else {
         rs = searcher.search(finalQuery, context.getSearchArgs().hits, BREAK_SCORE_TIES_BY_DOCID, true);
       }
+
+      if (context.getRerank()) {  // extract 1 from the ConstantScoreQuery
+        for (int i = 0; i < rs.scoreDocs.length; i++) { rs.scoreDocs[i].score -= 1; }
+      }
     } catch (IOException e) {
       e.printStackTrace();
       return docs;
     }
 
-    if (context.getRerank()) {  // extract 1 from the ConstantScoreQuery
-      for (int i = 0; i < rs.scoreDocs.length; i++) { rs.scoreDocs[i].score -= 1; }
-    }
+
     return ScoredDocuments.fromTopDocs(rs, searcher);
   }
 
