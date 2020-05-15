@@ -54,6 +54,7 @@ import org.kohsuke.args4j.CmdLineParser;
 import org.kohsuke.args4j.Option;
 import org.kohsuke.args4j.OptionHandlerFilter;
 import org.kohsuke.args4j.ParserProperties;
+import org.kohsuke.args4j.spi.StringArrayOptionHandler;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -126,6 +127,18 @@ public class SimpleSearcher implements Closeable {
     @Option(name = "-rm3.originalQueryWeight", usage = "RM3 parameter: weight to assign to the original query")
     public float rm3_originalQueryWeight = 0.5f;
 
+    @Option(name = "-rm3.fbTerms.multi", handler = StringArrayOptionHandler.class,
+            usage = "RM3 parameter: number of expansion terms")
+    public String[] rm3_fbTerms_array = new String[]{"10"};
+
+    @Option(name = "-rm3.fbDocs.multi", handler = StringArrayOptionHandler.class,
+            usage = "RM3 parameter: number of documents")
+    public String[] rm3_fbDocs_array = new String[]{"10"};
+
+    @Option(name = "-rm3.originalQueryWeight.multi", handler = StringArrayOptionHandler.class,
+            usage = "RM3 parameter: weight to assign to the original query")
+    public String[] rm3_originalQueryWeight_array = new String[]{"0.5"};
+
     @Option(name = "-hits", metaVar = "[number]", usage = "Max number of hits to return.")
     public int hits = 1000;
 
@@ -139,6 +152,7 @@ public class SimpleSearcher implements Closeable {
   protected RerankerCascade cascade;
   protected boolean isRerank;
 
+  protected static List<RerankerCascade> cascades;
   protected IndexSearcher searcher = null;
 
   /**
@@ -235,6 +249,26 @@ public class SimpleSearcher implements Closeable {
     cascade.add(new Rm3Reranker(this.analyzer, IndexArgs.CONTENTS,
         fbTerms, fbDocs, originalQueryWeight, rm3_outputQuery));
     cascade.add(new ScoreTiesAdjusterReranker());
+  }
+
+  public void setRM3Reranker(Args args) {
+    isRerank = true;
+    cascades = new ArrayList<>();
+
+    boolean rm3_outputQuery = false;
+    for (String fbTerms : args.rm3_fbTerms_array) {
+      for (String fbDocs : args.rm3_fbDocs_array) {
+        for (String originalQueryWeight : args.rm3_originalQueryWeight_array) {
+          String tag = String.format("rm3(fbTerms=%s,fbDocs=%s,originalQueryWeight=%s)",
+                  fbTerms, fbDocs, originalQueryWeight);
+          RerankerCascade cascade = new RerankerCascade(tag);
+          cascade.add(new Rm3Reranker(analyzer, IndexArgs.CONTENTS, Integer.valueOf(fbTerms),
+                  Integer.valueOf(fbDocs), Float.valueOf(originalQueryWeight), rm3_outputQuery));
+          cascade.add(new ScoreTiesAdjusterReranker());
+          cascades.add(cascade);
+        }
+      }
+    }
   }
 
   public void setLMDirichletSimilarity(float mu) {
@@ -378,36 +412,21 @@ public class SimpleSearcher implements Closeable {
 
     Result[] results = new Result[hits.ids.length];
 
-    BooleanQuery.Builder filterBuilder = new BooleanQuery.Builder();
-    for (int i = 0; i < hits.ids.length; i++) {
-      String docid = hits.documents[i].getField(IndexArgs.ID).stringValue();
-      Query tq = new ConstantScoreQuery(new TermQuery(new Term(IndexArgs.ID, docid)));
-      filterBuilder.add(new BooleanClause(tq, BooleanClause.Occur.SHOULD));
-    }
-    BooleanQuery filterQuery = filterBuilder.build();
-    BooleanQuery.Builder finalBuilder = new BooleanQuery.Builder();
-    finalBuilder.add(filterQuery, BooleanClause.Occur.MUST);
-    finalBuilder.add(query, BooleanClause.Occur.MUST);
-    Query fq = finalBuilder.build();
-    System.out.println("filter query: " + fq.toString() + "\n\n");
+//    BooleanQuery.Builder filterBuilder = new BooleanQuery.Builder();
+//    for (int i = 0; i < hits.ids.length; i++) {
+//      String docid = hits.documents[i].getField(IndexArgs.ID).stringValue();
+//      Query tq = new ConstantScoreQuery(new TermQuery(new Term(IndexArgs.ID, docid)));
+//      filterBuilder.add(new BooleanClause(tq, BooleanClause.Occur.SHOULD));
+//    }
+//    BooleanQuery filterQuery = filterBuilder.build();
+//    BooleanQuery.Builder finalBuilder = new BooleanQuery.Builder();
+//    finalBuilder.add(filterQuery, BooleanClause.Occur.MUST);
+//    finalBuilder.add(query, BooleanClause.Occur.MUST);
+//    Query fq = finalBuilder.build();
 
     for (int i = 0; i < hits.ids.length; i++) {
       Document doc = hits.documents[i];
       String docid = doc.getField(IndexArgs.ID).stringValue();
-      System.out.println(">>> docid : " + docid);
-
-      /*
-      Query filterquery = new ConstantScoreQuery(new TermQuery(new Term(IndexArgs.ID, docid)));
-      Query filterquery = new TermQuery(new Term(IndexArgs.ID, docid));
-      BooleanQuery.Builder builder = new BooleanQuery.Builder();
-      builder.add(filterquery, BooleanClause.Occur.MUST);
-      builder.add(query, BooleanClause.Occur.MUST);
-      Query finalQuery = builder.build();
-
-      System.out.println("doc filter query: " + filterquery.toString());
-      System.out.println("final: " + finalQuery.toString());
-      */
-
       IndexableField field;
       field = doc.getField(IndexArgs.CONTENTS);
       String contents = field == null ? null : field.stringValue();
@@ -421,7 +440,7 @@ public class SimpleSearcher implements Closeable {
     return results;
   }
 
-  protected Result[] rerank(String queryString, int k, Set<String> docids) throws IOException {
+  protected Result[] rerank(String queryString, int k, Set<String> docids, RerankerCascade cur_cascade) throws IOException {
     // Create an IndexSearch only once. Note that the object is thread safe.
     if (searcher == null) {
       searcher = new IndexSearcher(reader);
@@ -433,26 +452,6 @@ public class SimpleSearcher implements Closeable {
     searchArgs.hits = k;
 
     // from computeQueryDocumentScore
-    /*
-    List<TopDocs> allRs = new ArrayList<TopDocs>();
-    Query query = new BagOfWordsQueryGenerator().buildQuery(IndexArgs.CONTENTS, analyzer, queryString);
-    for (String docid : docids) {
-      Query filteredQuery = new ConstantScoreQuery(new TermQuery(new Term(IndexArgs.ID, docid)));
-
-      BooleanQuery.Builder builder = new BooleanQuery.Builder();
-      builder.add(filteredQuery, BooleanClause.Occur.MUST);
-      builder.add(query, BooleanClause.Occur.MUST);
-      Query finalQuery = builder.build();
-
-      TopDocs rs = searcher.search(finalQuery, 1);
-      if (rs.scoreDocs.length > 0) {
-        rs.scoreDocs[0].score -= 1;  // for the ConstantScoreQuery
-        allRs.add(rs);
-      }
-    }
-    TopDocs[] shardHits = allRs.toArray(new TopDocs[0]);
-    TopDocs rs = TopDocs.merge(allRs.size(), shardHits);
-    */
     BooleanQuery.Builder filterBuilder = new BooleanQuery.Builder();
     for (String docid: docids) {
       Query q = new ConstantScoreQuery(new TermQuery(new Term(IndexArgs.ID, docid)));
@@ -469,19 +468,19 @@ public class SimpleSearcher implements Closeable {
 
     int topK = Math.min(k, docids.size());
     TopDocs rs = searcher.search(finalQuery, topK);
+    for (int i = 0; i < rs.scoreDocs.length; i++) { rs.scoreDocs[i].score -= 1; }  // extract 1 from ConstantScoreQuery
 
     RerankerContext context;
     List<String> queryTokens = AnalyzerUtils.analyze(analyzer, queryString);
-    context = new RerankerContext<>(searcher, null, query, null,
-            queryString, queryTokens, null, searchArgs);
-    ScoredDocuments hits = cascade.run(ScoredDocuments.fromTopDocs(rs, searcher), context);
+    context = new RerankerContext<>(searcher, null, finalQuery, null,
+            queryString, queryTokens, null, searchArgs, true);  // the finalQuery here does not help the rm3 reranker
+    ScoredDocuments hits = cur_cascade.run(ScoredDocuments.fromTopDocs(rs, searcher), context);
 
     Result[] results = new Result[hits.ids.length];
     for (int i = 0; i < hits.ids.length; i++) {
       Document doc = hits.documents[i];
       String docid = doc.getField(IndexArgs.ID).stringValue();
 
-      System.out.println("rerank docid: " + docid);
       IndexableField field;
       field = doc.getField(IndexArgs.CONTENTS);
       String contents = field == null ? null : field.stringValue();
@@ -669,10 +668,6 @@ public class SimpleSearcher implements Closeable {
     SimpleSearcher searcher = new SimpleSearcher(searchArgs.index);
     SortedMap<Object, Map<String, String>> topics = TopicReader.getTopicsByFile(searchArgs.topics);
 
-    System.out.println("topics file |  " + searchArgs.topics);
-    System.out.println(String.format("length of topics: ||| %d ", topics.size())); // NullPointerException
-
-    PrintWriter out = new PrintWriter(Files.newBufferedWriter(Paths.get(searchArgs.output), StandardCharsets.US_ASCII));
     List<String> argsAsList = Arrays.asList(args);
 
     // Test a separate code path, where we specify BM25 explicitly, which is different from not specifying it at all.
@@ -685,7 +680,7 @@ public class SimpleSearcher implements Closeable {
     }
 
     if (searchArgs.useRM3) {
-      if (argsAsList.contains("-rm3.fbTerms") || argsAsList.contains("-rm3.fbTerms") ||
+      if (argsAsList.contains("-rm3.fbTerms") || argsAsList.contains("-rm3.fbDocs") ||
           argsAsList.contains("-rm3.originalQueryWeight")) {
         LOG.info("Testing code path of explicitly setting RM3 parameters.");
         searcher.setRM3Reranker(searchArgs.rm3_fbTerms, searchArgs.rm3_fbDocs, searchArgs.rm3_originalQueryWeight);
@@ -696,14 +691,48 @@ public class SimpleSearcher implements Closeable {
     }
 
     if (searchArgs.rerank) {
-      Map<String, Set<String>> qid2docids = searcher.get_docids(searchArgs.runfile);
-      for (Object id: topics.keySet()) {
-        Set<String> docids = qid2docids.get(id.toString());
-        Result[] results = searcher.rerank(topics.get(id).get("title"), searchArgs.hits, docids);
+//      if (argsAsList.contains("-rm3.fbTerms.multi") || argsAsList.contains("-rm3.fbDocs.multi") || argsAsList.contains("-rm3.originalQueryWeight.multi")) {
+      if (searchArgs.useRM3) {
+        LOG.info("Multi RM3 parameters");
+        searcher.setRM3Reranker(searchArgs);
       }
+      Map<String, Set<String>> qid2docids = searcher.get_docids(searchArgs.runfile);
+      int curline = 0;
+      int total = topics.size();
+
+      Map<String, PrintWriter> outs = new HashMap<String, PrintWriter>();
+      for (RerankerCascade cur_cascade: cascades) {
+        String name = cur_cascade.getTag();
+        String path = searchArgs.output + "_" + cur_cascade.getTag();
+        PrintWriter outtmp = new PrintWriter(Files.newBufferedWriter(Paths.get(path), StandardCharsets.US_ASCII));
+        outs.put(name, outtmp);
+      }
+
+      for (Object id: topics.keySet()) {
+        curline += 1;
+        if (! qid2docids.containsKey(id.toString())) { continue; }
+        if (curline % 1000 == 0) { LOG.info(String.format("Retrieving query %d / %d", curline, total)); }
+
+        Set<String> docids = qid2docids.get(id.toString());
+        System.out.println(String.format("qid: %s number of doc: %d", id.toString(), docids.size()));
+
+        for (RerankerCascade cur_cascade: cascades) {
+//        PrintWriter outtmp = new PrintWriter(Files.newBufferedWriter(
+//          Paths.get(searchArgs.output+cur_cascade.getTag()), StandardCharsets.US_ASCII));
+          PrintWriter outtmp = outs.get(cur_cascade.getTag());
+          Result[] results = searcher.rerank(topics.get(id).get("title"), searchArgs.hits, docids, cur_cascade);
+          for (int i = 0; i < results.length; i++) {
+            outtmp.println(String.format(Locale.US, "%s Q0 %s %d %f Anserini",
+                    id, results[i].docid, (i + 1), results[i].score));
+          }
+        }
+      }
+
+      for (String name: outs.keySet()) { outs.get(name).close(); }
       return;
     }
 
+    PrintWriter out = new PrintWriter(Files.newBufferedWriter(Paths.get(searchArgs.output), StandardCharsets.US_ASCII));
     if (searchArgs.threads == 1) {
       for (Object id : topics.keySet()) {
         Result[] results = searcher.search(topics.get(id).get("title"), searchArgs.hits);

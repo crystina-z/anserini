@@ -33,8 +33,10 @@ public class RerankerContext<K> {
   private final Query filter;
   private final SearchArgs searchArgs;
 
+  private final boolean rerank;
+
   public RerankerContext(IndexSearcher searcher, K queryId, Query query, String queryDocId, String queryText,
-      List<String> queryTokens, Query filter, SearchArgs searchArgs) throws IOException {
+       List<String> queryTokens, Query filter, SearchArgs searchArgs, boolean rerank) throws IOException {
     this.searcher = searcher;
     this.query = query;
     this.queryId = queryId;
@@ -43,6 +45,16 @@ public class RerankerContext<K> {
     this.queryTokens = queryTokens;
     this.filter = filter;
     this.searchArgs = searchArgs;
+    this.rerank = rerank;
+  }
+
+  public RerankerContext(IndexSearcher searcher, K queryId, Query query, String queryDocId, String queryText,
+      List<String> queryTokens, Query filter, SearchArgs searchArgs) throws IOException {
+    this(searcher, queryId, query, queryDocId, queryText, queryTokens, filter, searchArgs, false);
+  }
+
+  public boolean getRerank() {
+    return rerank;
   }
 
   public IndexSearcher getIndexSearcher() {

@@ -29,19 +29,15 @@ import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.index.Terms;
 import org.apache.lucene.index.TermsEnum;
-import org.apache.lucene.search.BooleanClause;
-import org.apache.lucene.search.BooleanQuery;
-import org.apache.lucene.search.BoostQuery;
-import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.Query;
-import org.apache.lucene.search.TermQuery;
-import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.search.*;
 import org.apache.lucene.util.BytesRef;
 
 import java.io.IOException;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Set;
+
+import org.apache.lucene.document.Document;
 
 import static io.anserini.search.SearchCollection.BREAK_SCORE_TIES_BY_DOCID;
 import static io.anserini.search.SearchCollection.BREAK_SCORE_TIES_BY_TWEETID;
@@ -108,6 +104,21 @@ public class Rm3Reranker implements Reranker {
         finalQuery = bqBuilder.build();
       }
 
+      if (context.getRerank()) {
+        BooleanQuery.Builder filterBuilder = new BooleanQuery.Builder();
+        for (Document doc: docs.documents) {
+          String docid = doc.getField(IndexArgs.ID).stringValue();
+          Query q = new ConstantScoreQuery(new TermQuery(new Term(IndexArgs.ID, docid)));
+          filterBuilder.add(q, BooleanClause.Occur.SHOULD);
+        }
+        Query filterQuery = filterBuilder.build();
+
+        BooleanQuery.Builder finalBuilder = new BooleanQuery.Builder();
+        finalBuilder.add(filterQuery, BooleanClause.Occur.MUST);
+        finalBuilder.add(feedbackQuery, BooleanClause.Occur.MUST);
+        finalQuery = finalBuilder.build();
+      }
+
       // Figure out how to break the scoring ties.
       if (context.getSearchArgs().arbitraryScoreTieBreak) {
         rs = searcher.search(finalQuery, context.getSearchArgs().hits);
@@ -121,6 +132,9 @@ public class Rm3Reranker implements Reranker {
       return docs;
     }
 
+    if (context.getRerank()) {  // extract 1 from the ConstantScoreQuery
+      for (int i = 0; i < rs.scoreDocs.length; i++) { rs.scoreDocs[i].score -= 1; }
+    }
     return ScoredDocuments.fromTopDocs(rs, searcher);
   }
 

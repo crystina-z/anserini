@@ -95,7 +95,8 @@ public abstract class TopicReader<K> {
       return TOPIC_FILE_TO_TYPE.get(file);
     }
 
-    return null;
+//    return null;
+    return TrecTopicReader.class; // tmp
   }
 
   public TopicReader(Path topicFile) {
