@@ -371,6 +371,82 @@ public class SimpleSearcher implements Closeable {
     return results;
   }
 
+
+  public Map<String, Result[]> batchRerank(List<String> queries, List<String> qids, int k,
+                                   Map<String, Set<String>> qid2docids, RerankerCascade cur_cascade, int threads) {
+    return batchRerankFields(queries, qids, k, qid2docids, cur_cascade, threads, new HashMap<>());
+  }
+
+  public Map<String, Result[]> batchRerank(List<String> queries, List<String> qids, int k,
+                                     Map<String, Set<String>> qid2docids, int threads) {
+    return batchRerank(queries, qids, k, qid2docids, cascade, threads);
+  }
+
+  public Map<String, Result[]> batchRerankFields(List<String> queries, List<String> qids, int k,
+           Map<String, Set<String>> qid2docids, RerankerCascade cur_cascade, int threads, Map<String, Float> fields) {
+    // Create the IndexSearcher here, if needed. We do it here because if we leave the creation to the search
+    // method, we might end up with a race condition as multiple threads try to concurrently create the IndexSearcher.
+    if (searcher == null) {
+      searcher = new IndexSearcher(reader);
+      searcher.setSimilarity(similarity);
+    }
+
+    ThreadPoolExecutor executor = (ThreadPoolExecutor) Executors.newFixedThreadPool(threads);
+    ConcurrentHashMap<String, Result[]> results = new ConcurrentHashMap<>();
+
+    long startTime = System.nanoTime();
+    AtomicLong index = new AtomicLong();
+    int queryCnt = queries.size();
+    for (int q = 0; q < queryCnt; ++q) {
+      String query = queries.get(q);
+      String qid = qids.get(q);
+      executor.execute(() -> {
+        try {
+          if (fields.size() > 0) {
+            // results.put(qid, searchFields(query, fields, k));
+            System.out.println("rerank field is not supported so far");
+          } else {
+            if (qid2docids.containsKey(qid)) {
+              Set<String> docids = qid2docids.get(qid);
+              results.put(qid, rerank(query, k, docids, cur_cascade));
+            }
+          }
+        } catch (IOException e) {
+          throw new CompletionException(e);
+        }
+
+        // logging for speed
+        Long lineNumber = index.incrementAndGet();
+        if (lineNumber % 1000 == 0) {
+          double timePerQuery = (double) (System.nanoTime() - startTime) / (lineNumber + 1) / 1e9;
+          LOG.info(String.format("Retrieving query " + lineNumber + " (%.3f s/query)", timePerQuery));
+        }
+      });
+    }
+
+    executor.shutdown();
+
+    try {
+      // Wait for existing tasks to terminate
+      while (!executor.awaitTermination(1, TimeUnit.MINUTES)) {
+        LOG.info(String.format("%.2f percent completed",
+                (double) executor.getCompletedTaskCount() / queries.size() * 100.0d));
+      }
+    } catch (InterruptedException ie) {
+      // (Re-)Cancel if current thread also interrupted
+      executor.shutdownNow();
+      // Preserve interrupt status
+      Thread.currentThread().interrupt();
+    }
+
+    if (queryCnt != executor.getCompletedTaskCount()) {
+      throw new RuntimeException("queryCount = " + queryCnt +
+              " is not equal to completedTaskCount =  " + executor.getCompletedTaskCount());
+    }
+
+    return results;
+  }
+
   public Result[] search(String q) throws IOException {
     return search(q, 10);
   }
@@ -451,7 +527,7 @@ public class SimpleSearcher implements Closeable {
       searcher.setSimilarity(similarity);
     }
 
-    System.out.print(String.format("qid number of doc: %d; expect %d", docids.size(), k));
+//    System.out.print(String.format("qid number of doc: %d; expect %d", docids.size(), k));
 
     SearchArgs searchArgs = new SearchArgs();
     searchArgs.arbitraryScoreTieBreak = false;
@@ -476,7 +552,7 @@ public class SimpleSearcher implements Closeable {
     TopDocs rs = searcher.search(finalQuery, topK);
     for (int i = 0; i < rs.scoreDocs.length; i++) { rs.scoreDocs[i].score -= 1; }  // extract 1 from ConstantScoreQuery
 
-    System.out.print(String.format("\t>> after bm25: %d", rs.scoreDocs.length));
+//    System.out.print(String.format("\t>> after bm25: %d", rs.scoreDocs.length));
 
     RerankerContext context;
     List<String> queryTokens = AnalyzerUtils.analyze(analyzer, queryString);
@@ -499,7 +575,7 @@ public class SimpleSearcher implements Closeable {
 
       results[i] = new Result(docid, hits.ids[i], hits.scores[i], contents, raw, doc);
     }
-    System.out.println(String.format("\t>> after rm3: %d", results.length));
+//    System.out.println(String.format("\t>> after rm3: %d", results.length));
 
     return results;
   }
@@ -708,9 +784,6 @@ public class SimpleSearcher implements Closeable {
       }
 
       Map<String, Set<String>> qid2docids = searcher.get_docids(searchArgs.runfile);
-      int curline = 0;
-      int total = topics.size();
-
       Map<String, PrintWriter> outs = new HashMap<String, PrintWriter>();
       if (cascades.size() > 0) {
         for (RerankerCascade cur_cascade: cascades) {
@@ -718,36 +791,73 @@ public class SimpleSearcher implements Closeable {
           String path = searchArgs.output + "_" + cur_cascade.getTag();
           PrintWriter outtmp = new PrintWriter(Files.newBufferedWriter(Paths.get(path), StandardCharsets.US_ASCII));
           outs.put(name, outtmp);
-        }
+        } // for
       } else {
         PrintWriter out = new PrintWriter(Files.newBufferedWriter(Paths.get(searchArgs.output), StandardCharsets.US_ASCII));
         outs.put("default", out);
-      }
+      } // if
 
-      for (Object id: topics.keySet()) {
-        curline += 1;
-        if (! qid2docids.containsKey(id.toString())) { continue; }
-        if (curline % 1000 == 0) { LOG.info(String.format("Retrieving query %d / %d", curline, total)); }
+      // threads
+      if (searchArgs.threads == 1) {
+        int curline = 0;
+        int total = topics.size();
 
-        Set<String> docids = qid2docids.get(id.toString());
+        for (Object id: topics.keySet()) {
+          curline += 1;
+          if (! qid2docids.containsKey(id.toString())) { continue; }
+          if (curline % 1000 == 0) { LOG.info(String.format("Retrieving query %d / %d", curline, total)); }
 
-        if (cascades.size() > 0) {
-          for (RerankerCascade cur_cascade: cascades) {
+          Set<String> docids = qid2docids.get(id.toString());
+
+          if (cascades.size() > 0) {
+            for (RerankerCascade cur_cascade: cascades) {
 //        PrintWriter outtmp = new PrintWriter(Files.newBufferedWriter(
 //          Paths.get(searchArgs.output+cur_cascade.getTag()), StandardCharsets.US_ASCII));
-            PrintWriter outtmp = outs.get(cur_cascade.getTag());
-            Result[] results = searcher.rerank(topics.get(id).get("title"), searchArgs.hits, docids, cur_cascade);
-            for (int i = 0; i < results.length; i++) { outtmp.println(String.format(Locale.US, "%s Q0 %s %d %f Anserini", id, results[i].docid, (i + 1), results[i].score)); }
-          } // for
-        } else {
-          Result[] results = searcher.rerank(topics.get(id).get("title"), searchArgs.hits, docids);
-          for (int i = 0; i < results.length; i++) {
-            outs.get("default").println(String.format(Locale.US, "%s Q0 %s %d %f Anserini", id, results[i].docid, (i + 1), results[i].score));
-          } // for
-        } // if
-      } // for
+              PrintWriter outtmp = outs.get(cur_cascade.getTag());
+              Result[] results = searcher.rerank(topics.get(id).get("title"), searchArgs.hits, docids, cur_cascade);
+              for (int i = 0; i < results.length; i++) { outtmp.println(String.format(Locale.US, "%s Q0 %s %d %f Anserini", id, results[i].docid, (i + 1), results[i].score)); }
+            } // for
+          } else {
+            Result[] results = searcher.rerank(topics.get(id).get("title"), searchArgs.hits, docids);
+            for (int i = 0; i < results.length; i++) {
+              outs.get("default").println(String.format(Locale.US, "%s Q0 %s %d %f Anserini", id, results[i].docid, (i + 1), results[i].score));
+            } // for
+          } // if
+        } // for
 
-      for (String name: outs.keySet()) { outs.get(name).close(); }
+      } else {
+        List<String> qids = new ArrayList<>();
+        List<String> queries = new ArrayList<>();
+        for (Object id : topics.keySet()) { qids.add(id.toString()); queries.add(topics.get(id).get("title")); }
+
+        Map<String, Map<String, Result[]>> tag2AllResults = new HashMap<String, Map<String, Result[]>>();
+        if (cascades.size() > 0) {
+          for (RerankerCascade cur_cascade: cascades) {
+            Map<String, Result[]> allResults = searcher.batchRerank(queries, qids, searchArgs.hits, qid2docids, searchArgs.threads);
+            for (String id : allResults.keySet()) {
+              Result[] results = allResults.get(id);
+              // print
+              for (int i = 0; i < results.length; i++) {
+                outs.get(cur_cascade.getTag()).println(String.format(Locale.US, "%s Q0 %s %d %f Anserini",
+                        id, results[i].docid, (i + 1), results[i].score));
+              } // for
+            } // for
+          }
+        } else {
+          Map<String, Result[]> allResults = searcher.batchRerank(queries, qids, searchArgs.hits, qid2docids, searchArgs.threads);
+          tag2AllResults.put("default", allResults);
+          for (String id : allResults.keySet()) {
+            Result[] results = allResults.get(id);
+            // print
+            for (int i = 0; i < results.length; i++) {
+              outs.get("default").println(String.format(Locale.US, "%s Q0 %s %d %f Anserini",
+                      id, results[i].docid, (i + 1), results[i].score));
+            } // for
+          } // for
+        }
+      } // if
+
+      for (String name: outs.keySet()) { outs.get(name).close(); } // for
       return;
     }
 

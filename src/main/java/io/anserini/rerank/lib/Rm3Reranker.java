@@ -35,12 +35,12 @@ import org.apache.lucene.util.BytesRef;
 import java.io.IOException;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.Map;
 import java.util.Set;
 
 import org.apache.lucene.document.Document;
 
-import static io.anserini.search.SearchCollection.BREAK_SCORE_TIES_BY_DOCID;
-import static io.anserini.search.SearchCollection.BREAK_SCORE_TIES_BY_TWEETID;
+import static io.anserini.search.SearchCollection.*;
 
 public class Rm3Reranker implements Reranker {
   private static final Logger LOG = LogManager.getLogger(Rm3Reranker.class);
@@ -104,10 +104,9 @@ public class Rm3Reranker implements Reranker {
         finalQuery = bqBuilder.build();
       }
 
+      // add filtering for rm3
       if (context.getRerank()) {
         BooleanQuery.Builder filterBuilder = new BooleanQuery.Builder();
-//        for (Document doc: docs.documents) {
-//          String docid = doc.getField(IndexArgs.ID).stringValue();
         Set<String> docids = context.getRerankDocids();
         for (String docid : docids) {
           Query q = new ConstantScoreQuery(new TermQuery(new Term(IndexArgs.ID, docid)));
@@ -121,23 +120,24 @@ public class Rm3Reranker implements Reranker {
         finalQuery = finalBuilder.build();
       }
 
+      int nhits = context.getSearchArgs().hits;
+      if (context.getRerank()) { nhits = Math.min(context.getRerankDocids().size(), nhits); }
+
       // Figure out how to break the scoring ties.
       if (context.getSearchArgs().arbitraryScoreTieBreak) {
-        rs = searcher.search(finalQuery, context.getSearchArgs().hits);
+        rs = searcher.search(finalQuery, nhits);
       } else if (context.getSearchArgs().searchtweets) {
-        rs = searcher.search(finalQuery, context.getSearchArgs().hits, BREAK_SCORE_TIES_BY_TWEETID, true);
+        rs = searcher.search(finalQuery, nhits, BREAK_SCORE_TIES_BY_TWEETID, true);
       } else {
-        rs = searcher.search(finalQuery, context.getSearchArgs().hits, BREAK_SCORE_TIES_BY_DOCID, true);
+        rs = searcher.search(finalQuery, nhits, BREAK_SCORE_TIES_BY_DOCID, true);
       }
 
-      if (context.getRerank()) {  // extract 1 from the ConstantScoreQuery
-        for (int i = 0; i < rs.scoreDocs.length; i++) { rs.scoreDocs[i].score -= 1; }
-      }
+      if (context.getRerank()) { for (int i = 0; i < rs.scoreDocs.length; i++) { rs.scoreDocs[i].score -= 1; } }
+
     } catch (IOException e) {
       e.printStackTrace();
       return docs;
     }
-
 
     return ScoredDocuments.fromTopDocs(rs, searcher);
   }
