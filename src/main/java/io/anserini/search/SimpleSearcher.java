@@ -27,6 +27,7 @@ import io.anserini.rerank.lib.Rm3Reranker;
 import io.anserini.rerank.lib.ScoreTiesAdjusterReranker;
 import io.anserini.search.query.BagOfWordsQueryGenerator;
 import io.anserini.search.query.QueryGenerator;
+import io.anserini.search.similarity.TaggedSimilarity;
 import io.anserini.search.topicreader.TopicReader;
 import org.apache.commons.lang3.time.DurationFormatUtils;
 import org.apache.logging.log4j.LogManager;
@@ -109,6 +110,14 @@ public class SimpleSearcher implements Closeable {
     @Option(name = "-bm25.b", usage = "BM25 b value.", forbids = {"-ql"})
     public float bm25_b = 0.4f;
 
+    @Option(name = "-bm25.k1.multi", handler = StringArrayOptionHandler.class,
+            usage = "BM25 k1 value.", forbids = {"-ql"})
+    public String[] bm25_k1_array = new String[]{"0.9"};
+
+    @Option(name = "-bm25.b.multi", handler = StringArrayOptionHandler.class,
+            usage = "BM25 b value.", forbids = {"-ql"})
+    public String[] bm25_b_array = new String[]{"0.4"};
+
     @Option(name = "-qld", usage = "Flag to use query-likelihood with Dirichlet smoothing.", forbids={"-bm25"})
     public Boolean useQL = false;
 
@@ -153,6 +162,8 @@ public class SimpleSearcher implements Closeable {
   protected boolean isRerank;
 
   protected static List<RerankerCascade> cascades =  new ArrayList<RerankerCascade>();
+  protected static List<TaggedSimilarity> similarities = new ArrayList<TaggedSimilarity>();
+
   protected IndexSearcher searcher = null;
 
   /**
@@ -194,11 +205,13 @@ public class SimpleSearcher implements Closeable {
     SearchArgs defaults = new SearchArgs();
 
     this.reader = DirectoryReader.open(FSDirectory.open(indexPath));
-    this.similarity = new BM25Similarity(Float.parseFloat(defaults.bm25_k1[0]), Float.parseFloat(defaults.bm25_b[0]));
+//    this.similarity = new BM25Similarity(Float.parseFloat(defaults.bm25_k1[0]), Float.parseFloat(defaults.bm25_b[0]));
     this.analyzer = analyzer;
     this.isRerank = false;
+
     cascade = new RerankerCascade();
     cascade.add(new ScoreTiesAdjusterReranker());
+    cascades.add(cascade);
   }
 
   public void setAnalyzer(Analyzer analyzer) {
@@ -253,7 +266,7 @@ public class SimpleSearcher implements Closeable {
 
   public void setRM3Reranker(Args args) {
     isRerank = true;
-//    cascades = new ArrayList<>();
+    cascades.clear();
 
     boolean rm3_outputQuery = false;
     for (String fbTerms : args.rm3_fbTerms_array) {
@@ -285,6 +298,15 @@ public class SimpleSearcher implements Closeable {
     // We need to re-initialize the searcher
     searcher = new IndexSearcher(reader);
     searcher.setSimilarity(similarity);
+  }
+
+  public void setBM25Similarity(Args args) {
+    for (String k1: args.bm25_k1_array) {
+      for (String b: args.bm25_b_array) {
+        similarities.add(new TaggedSimilarity(new BM25Similarity(Float.valueOf(k1), Float.valueOf(b)),
+                String.format("bm25(k1=%s,b=%s)", k1, b)));
+      }
+    }
   }
 
   /**
@@ -371,25 +393,24 @@ public class SimpleSearcher implements Closeable {
     return results;
   }
 
-
   public Map<String, Result[]> batchRerank(List<String> queries, List<String> qids, int k,
-                                   Map<String, Set<String>> qid2docids, RerankerCascade cur_cascade, int threads) {
-    return batchRerankFields(queries, qids, k, qid2docids, cur_cascade, threads, new HashMap<>());
+           Map<String, Set<String>> qid2docids, Similarity similarity, RerankerCascade cur_cascade, int threads) {
+    return batchRerankFields(queries, qids, k, qid2docids, similarity, cur_cascade, threads, new HashMap<>());
   }
 
   public Map<String, Result[]> batchRerank(List<String> queries, List<String> qids, int k,
                                      Map<String, Set<String>> qid2docids, int threads) {
-    return batchRerank(queries, qids, k, qid2docids, cascade, threads);
+    return batchRerank(queries, qids, k, qid2docids, similarity, cascade, threads);
   }
 
   public Map<String, Result[]> batchRerankFields(List<String> queries, List<String> qids, int k,
-           Map<String, Set<String>> qid2docids, RerankerCascade cur_cascade, int threads, Map<String, Float> fields) {
+           Map<String, Set<String>> qid2docids, Similarity similarity, RerankerCascade cur_cascade, int threads, Map<String, Float> fields) {
     // Create the IndexSearcher here, if needed. We do it here because if we leave the creation to the search
     // method, we might end up with a race condition as multiple threads try to concurrently create the IndexSearcher.
-    if (searcher == null) {
-      searcher = new IndexSearcher(reader);
-      searcher.setSimilarity(similarity);
-    }
+//    if (searcher == null) {
+//      searcher = new IndexSearcher(reader);
+//      searcher.setSimilarity(similarity);
+//    }
 
     ThreadPoolExecutor executor = (ThreadPoolExecutor) Executors.newFixedThreadPool(threads);
     ConcurrentHashMap<String, Result[]> results = new ConcurrentHashMap<>();
@@ -408,7 +429,7 @@ public class SimpleSearcher implements Closeable {
           } else {
             if (qid2docids.containsKey(qid)) {
               Set<String> docids = qid2docids.get(qid);
-              results.put(qid, rerank(query, k, docids, cur_cascade));
+              results.put(qid, rerank(query, k, docids, similarity, cur_cascade));
             }
           }
         } catch (IOException e) {
@@ -517,17 +538,17 @@ public class SimpleSearcher implements Closeable {
   }
 
   protected Result[] rerank(String queryString, int k, Set<String> docids) throws IOException {
-    return rerank(queryString, k, docids, cascade);
+    return rerank(queryString, k, docids, similarity, cascade);
   }
 
-  protected Result[] rerank(String queryString, int k, Set<String> docids, RerankerCascade cur_cascade) throws IOException {
+  protected Result[] rerank(String queryString, int k, Set<String> docids, Similarity similarity, RerankerCascade cur_cascade) throws IOException {
     // Create an IndexSearch only once. Note that the object is thread safe.
-    if (searcher == null) {
-      searcher = new IndexSearcher(reader);
-      searcher.setSimilarity(similarity);
-    }
-
-//    System.out.print(String.format("qid number of doc: %d; expect %d", docids.size(), k));
+//    if (searcher == null) {
+//    searcher = new IndexSearcher(reader);
+//    searcher.setSimilarity(similarity);
+//    }
+    IndexSearcher searcher = new IndexSearcher(reader);
+    searcher.setSimilarity(similarity);
 
     SearchArgs searchArgs = new SearchArgs();
     searchArgs.arbitraryScoreTieBreak = false;
@@ -552,8 +573,6 @@ public class SimpleSearcher implements Closeable {
     TopDocs rs = searcher.search(finalQuery, topK);
     for (int i = 0; i < rs.scoreDocs.length; i++) { rs.scoreDocs[i].score -= 1; }  // extract 1 from ConstantScoreQuery
 
-//    System.out.print(String.format("\t>> after bm25: %d", rs.scoreDocs.length));
-
     RerankerContext context;
     List<String> queryTokens = AnalyzerUtils.analyze(analyzer, queryString);
 
@@ -575,7 +594,6 @@ public class SimpleSearcher implements Closeable {
 
       results[i] = new Result(docid, hits.ids[i], hits.scores[i], contents, raw, doc);
     }
-//    System.out.println(String.format("\t>> after rm3: %d", results.length));
 
     return results;
   }
@@ -759,7 +777,11 @@ public class SimpleSearcher implements Closeable {
     // Test a separate code path, where we specify BM25 explicitly, which is different from not specifying it at all.
     if (argsAsList.contains("-bm25")) {
       LOG.info("Testing code path of explicitly setting BM25.");
-      searcher.setBM25Similarity(searchArgs.bm25_k1, searchArgs.bm25_b);
+      if (argsAsList.contains("-bm25.k1.multi") || argsAsList.contains("-bm25.b.multi")) {
+        searcher.setBM25Similarity(searchArgs);
+      } else {
+        searcher.setBM25Similarity(searchArgs.bm25_k1, searchArgs.bm25_b);
+      }
     } else if (searchArgs.useQL){
       LOG.info("Testing code path of explicitly setting QL.");
       searcher.setLMDirichletSimilarity(searchArgs.ql_mu);
@@ -786,12 +808,16 @@ public class SimpleSearcher implements Closeable {
       Map<String, Set<String>> qid2docids = searcher.get_docids(searchArgs.runfile);
       Map<String, PrintWriter> outs = new HashMap<String, PrintWriter>();
       if (cascades.size() > 0) {
-        for (RerankerCascade cur_cascade: cascades) {
-          String name = cur_cascade.getTag();
-          String path = searchArgs.output + "_" + cur_cascade.getTag();
-          PrintWriter outtmp = new PrintWriter(Files.newBufferedWriter(Paths.get(path), StandardCharsets.US_ASCII));
-          outs.put(name, outtmp);
-        } // for
+        assert similarities.size() > 0;
+
+        for (TaggedSimilarity similarity: similarities) {
+          for (RerankerCascade cur_cascade: cascades) {
+            String name = similarity.getTag() + "_" + cur_cascade.getTag();
+            String path = searchArgs.output + "_" + name;
+            PrintWriter outtmp = new PrintWriter(Files.newBufferedWriter(Paths.get(path), StandardCharsets.US_ASCII));
+            outs.put(name, outtmp);
+          } // for
+        }
       } else {
         PrintWriter out = new PrintWriter(Files.newBufferedWriter(Paths.get(searchArgs.output), StandardCharsets.US_ASCII));
         outs.put("default", out);
@@ -810,12 +836,15 @@ public class SimpleSearcher implements Closeable {
           Set<String> docids = qid2docids.get(id.toString());
 
           if (cascades.size() > 0) {
-            for (RerankerCascade cur_cascade: cascades) {
-//        PrintWriter outtmp = new PrintWriter(Files.newBufferedWriter(
-//          Paths.get(searchArgs.output+cur_cascade.getTag()), StandardCharsets.US_ASCII));
-              PrintWriter outtmp = outs.get(cur_cascade.getTag());
-              Result[] results = searcher.rerank(topics.get(id).get("title"), searchArgs.hits, docids, cur_cascade);
-              for (int i = 0; i < results.length; i++) { outtmp.println(String.format(Locale.US, "%s Q0 %s %d %f Anserini", id, results[i].docid, (i + 1), results[i].score)); }
+            assert similarities.size() > 0;
+
+            for (TaggedSimilarity similarity: similarities) {
+              for (RerankerCascade cur_cascade: cascades) {
+                String name = similarity.getTag() + "_" + cur_cascade.getTag();
+                Result[] results = searcher.rerank(
+                        topics.get(id).get("title"), searchArgs.hits, docids, similarity.getSimilarity(), cur_cascade);
+                for (int i = 0; i < results.length; i++) { outs.get(name).println(String.format(Locale.US, "%s Q0 %s %d %f Anserini", id, results[i].docid, (i + 1), results[i].score)); }
+              }
             } // for
           } else {
             Result[] results = searcher.rerank(topics.get(id).get("title"), searchArgs.hits, docids);
@@ -832,19 +861,23 @@ public class SimpleSearcher implements Closeable {
 
         Map<String, Map<String, Result[]>> tag2AllResults = new HashMap<String, Map<String, Result[]>>();
         if (cascades.size() > 0) {
-          for (RerankerCascade cur_cascade: cascades) {
-            Map<String, Result[]> allResults = searcher.batchRerank(queries, qids, searchArgs.hits, qid2docids, searchArgs.threads);
-            for (String id : allResults.keySet()) {
-              Result[] results = allResults.get(id);
-              // print
-              for (int i = 0; i < results.length; i++) {
-                outs.get(cur_cascade.getTag()).println(String.format(Locale.US, "%s Q0 %s %d %f Anserini",
-                        id, results[i].docid, (i + 1), results[i].score));
+          assert similarities.size() > 0;
+
+          for (TaggedSimilarity similarity: similarities) {
+            for (RerankerCascade cur_cascade: cascades) {
+              Map<String, Result[]> allResults = searcher.batchRerank(
+                      queries, qids, searchArgs.hits, qid2docids, similarity.getSimilarity(), cur_cascade, searchArgs.threads);
+              for (String id : allResults.keySet()) {
+                Result[] results = allResults.get(id);
+                // print
+                String name = similarity.getTag() + "_" + cur_cascade.getTag();
+                for (int i = 0; i < results.length; i++) { outs.get(name).println(String.format(Locale.US, "%s Q0 %s %d %f Anserini", id, results[i].docid, (i + 1), results[i].score)); } // for
               } // for
-            } // for
+            }
           }
         } else {
-          Map<String, Result[]> allResults = searcher.batchRerank(queries, qids, searchArgs.hits, qid2docids, searchArgs.threads);
+          Map<String, Result[]> allResults = searcher.batchRerank(
+                  queries, qids, searchArgs.hits, qid2docids, searchArgs.threads);
           tag2AllResults.put("default", allResults);
           for (String id : allResults.keySet()) {
             Result[] results = allResults.get(id);
