@@ -799,7 +799,6 @@ public class SimpleSearcher implements Closeable {
     }
 
     if (searchArgs.rerank) {
-//      if (argsAsList.contains("-rm3.fbTerms.multi") || argsAsList.contains("-rm3.fbDocs.multi") || argsAsList.contains("-rm3.originalQueryWeight.multi")) {
       if (searchArgs.useRM3) {
         LOG.info("Multi RM3 parameters");
         searcher.setRM3Reranker(searchArgs);
@@ -807,6 +806,8 @@ public class SimpleSearcher implements Closeable {
 
       Map<String, Set<String>> qid2docids = searcher.get_docids(searchArgs.runfile);
       Map<String, PrintWriter> outs = new HashMap<String, PrintWriter>();
+
+      // preparing files
       if (cascades.size() > 0) {
         assert similarities.size() > 0;
 
@@ -814,6 +815,7 @@ public class SimpleSearcher implements Closeable {
           for (RerankerCascade cur_cascade: cascades) {
             String name = similarity.getTag() + "_" + cur_cascade.getTag();
             String path = searchArgs.output + "_" + name;
+
             PrintWriter outtmp = new PrintWriter(Files.newBufferedWriter(Paths.get(path), StandardCharsets.US_ASCII));
             outs.put(name, outtmp);
           } // for
@@ -841,8 +843,7 @@ public class SimpleSearcher implements Closeable {
             for (TaggedSimilarity similarity: similarities) {
               for (RerankerCascade cur_cascade: cascades) {
                 String name = similarity.getTag() + "_" + cur_cascade.getTag();
-                Result[] results = searcher.rerank(
-                        topics.get(id).get("title"), searchArgs.hits, docids, similarity.getSimilarity(), cur_cascade);
+                Result[] results = searcher.rerank(topics.get(id).get("title"), searchArgs.hits, docids, similarity.getSimilarity(), cur_cascade);
                 for (int i = 0; i < results.length; i++) { outs.get(name).println(String.format(Locale.US, "%s Q0 %s %d %f Anserini", id, results[i].docid, (i + 1), results[i].score)); }
               }
             } // for
@@ -853,7 +854,6 @@ public class SimpleSearcher implements Closeable {
             } // for
           } // if
         } // for
-
       } else {
         List<String> qids = new ArrayList<>();
         List<String> queries = new ArrayList<>();

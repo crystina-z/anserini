@@ -85,6 +85,8 @@ public class Rm3Reranker implements Reranker {
     }
 
     Query feedbackQuery = feedbackQueryBuilder.build();
+//    System.out.println("Previous query: " + context.getQuery().toString());
+//    System.out.println("feedbackQuery: " + feedbackQuery.toString());
 
     if (this.outputQuery) {
       LOG.info("QID: " + context.getQueryId());
